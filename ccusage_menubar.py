@@ -25,7 +25,7 @@ except BlockingIOError:
 
 # Add repo dir to path so we can import ccusage helpers
 sys.path.insert(0, str(Path(__file__).parent))
-from ccusage import fetch_plan_usage, current_session_id, last_turn_context, CONTEXT_LIMIT
+from ccusage import fetch_plan_usage, active_sessions, last_turn_context, CONTEXT_LIMIT
 
 REFRESH_SECS = 60  # how often to poll
 
@@ -75,18 +75,22 @@ class CcusageApp(rumps.App):
     def _fetch_worker(self):
         plan = fetch_plan_usage()
 
-        ctx_pct = None
-        sid = current_session_id()
-        if sid:
-            last_u = last_turn_context(sid)
+        # Collect context % for each active session
+        sess_ctxs = []
+        for sess in active_sessions():
+            last_u = last_turn_context(sess["session_id"])
             if last_u:
                 ctx_used = (last_u.get("input_tokens", 0) +
                             last_u.get("cache_creation_input_tokens", 0) +
                             last_u.get("cache_read_input_tokens", 0))
-                ctx_pct = ctx_used / CONTEXT_LIMIT * 100
+                sess_ctxs.append({
+                    "name":    sess["name"],
+                    "status":  sess["status"],
+                    "ctx_pct": ctx_used / CONTEXT_LIMIT * 100,
+                })
 
         with self._lock:
-            self._pending = {"plan": plan, "ctx_pct": ctx_pct, "ready": True}
+            self._pending = {"plan": plan, "sess_ctxs": sess_ctxs, "ready": True}
         self._fetching = False
 
     # ── Timer: runs on main thread, applies pending data ─────────────────────
@@ -108,19 +112,21 @@ class CcusageApp(rumps.App):
     # ── Apply data to UI (main thread) ────────────────────────────────────────
 
     def _apply(self, data):
-        plan    = data.get("plan") or {}
-        ctx_pct = data.get("ctx_pct")
+        plan      = data.get("plan") or {}
+        sess_ctxs = data.get("sess_ctxs") or []
 
         fh = plan.get("five_hour") or {}
         sd = plan.get("seven_day") or {}
         fh_pct = fh.get("utilization")
         sd_pct = sd.get("utilization")
 
-        # Menu bar title
+        # Menu bar title — show 5h% and active session count
+        n_active = sum(1 for s in sess_ctxs if s["status"] == "busy")
+        sess_tag = f"  {n_active}●" if n_active else ""
         if fh_pct is not None:
-            self.title = f"5h:{fh_pct:.0f}% {pct_emoji(fh_pct)}"
+            self.title = f"5h:{fh_pct:.0f}%{sess_tag} {pct_emoji(fh_pct)}"
         else:
-            self.title = "ccusage ⚪"
+            self.title = f"ccusage{sess_tag} ⚪"
 
         # Rebuild menu
         self.menu.clear()
@@ -134,13 +140,18 @@ class CcusageApp(rumps.App):
             self.menu.add(rumps.MenuItem(
                 f"7-day   {mini_bar(sd_pct)}  {sd_pct:.0f}%"
             ))
-        if ctx_pct is not None:
-            left_k = (CONTEXT_LIMIT - int(ctx_pct / 100 * CONTEXT_LIMIT)) // 1000
-            self.menu.add(rumps.MenuItem(
-                f"Context {mini_bar(ctx_pct)}  {ctx_pct:.0f}%  ({left_k}k left)"
-            ))
 
-        if fh_pct is None and sd_pct is None:
+        if sess_ctxs:
+            self.menu.add(None)
+            for s in sess_ctxs:
+                dot  = "●" if s["status"] == "busy" else "○"
+                name = s["name"].split("/")[-1] or s["name"]  # last path component
+                left_k = (CONTEXT_LIMIT - int(s["ctx_pct"] / 100 * CONTEXT_LIMIT)) // 1000
+                self.menu.add(rumps.MenuItem(
+                    f"{dot} {name}  {mini_bar(s['ctx_pct'])}  {s['ctx_pct']:.0f}%  ({left_k}k)"
+                ))
+
+        if fh_pct is None and not sess_ctxs:
             self.menu.add(rumps.MenuItem("No data — log into claude.ai in Firefox"))
 
         self.menu.add(None)
