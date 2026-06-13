@@ -25,7 +25,24 @@ from collections import defaultdict
 
 PROJECTS_DIR  = Path.home() / ".claude" / "projects"
 SESSIONS_DIR  = Path.home() / ".claude" / "sessions"
-CONTEXT_LIMIT = 200_000  # Sonnet 4.x context window
+CONTEXT_LIMIT = 200_000  # default context window (kept for back-compat imports)
+
+# Per-model context windows, matched by substring on the model id. Most current
+# Claude models (Opus/Sonnet/Haiku 4.x) are 200k, so the default is correct for
+# them — this map exists so 1M-context betas or future models can override
+# without touching call sites.
+MODEL_CONTEXT_LIMITS = {
+    # "claude-...-1m": 1_000_000,
+}
+
+
+def context_limit(model):
+    """Context window size for a model id, defaulting to CONTEXT_LIMIT."""
+    if model:
+        for key, lim in MODEL_CONTEXT_LIMITS.items():
+            if key in model:
+                return lim
+    return CONTEXT_LIMIT
 
 # Sonnet 4.x API pricing (per million tokens) — informational only for sub users
 PRICING = {
@@ -186,12 +203,43 @@ def active_sessions():
     return sorted(sessions, key=lambda s: s["updated_at"], reverse=True)
 
 
-def last_turn_context(session_id):
+def _session_jsonl(session_id):
+    """Locate the JSONL transcript for a session id (exact name, then substring)."""
+    for jsonl in PROJECTS_DIR.rglob(f"{session_id}.jsonl"):
+        return jsonl
     for jsonl in PROJECTS_DIR.rglob("*.jsonl"):
-        if session_id not in jsonl.name:
-            continue
-        last = None
-        for line in open(jsonl, encoding="utf-8"):
+        if session_id in jsonl.name:
+            return jsonl
+    return None
+
+
+def _tail_lines(path, max_bytes):
+    """Return decoded lines from the last `max_bytes` of a file (drops the
+    possibly-partial first line when the read didn't start at byte 0)."""
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        start = max(0, f.tell() - max_bytes)
+        f.seek(start)
+        data = f.read()
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    if start > 0 and lines:
+        lines = lines[1:]
+    return lines
+
+
+def _last_assistant_usage(session_id, max_bytes=256 * 1024):
+    """Return (usage_dict, model) for a session's most recent assistant turn.
+
+    Reads only the file tail — the hot path for gating decisions. Falls back to
+    a full scan if the tail window happens to contain no assistant usage (e.g. a
+    very large trailing user message), so correctness is never worse than before.
+    """
+    path = _session_jsonl(session_id)
+    if not path:
+        return None
+
+    def scan(lines):
+        for line in reversed(lines):
             line = line.strip()
             if not line:
                 continue
@@ -199,12 +247,51 @@ def last_turn_context(session_id):
                 d = json.loads(line)
             except Exception:
                 continue
-            if d.get("type") == "assistant" and "message" in d:
-                u = d["message"].get("usage")
+            if d.get("type") == "assistant":
+                msg = d.get("message", {})
+                u = msg.get("usage")
                 if u:
-                    last = u
-        return last
-    return None
+                    return u, msg.get("model")
+        return None
+
+    hit = scan(_tail_lines(path, max_bytes))
+    if hit is None:
+        try:
+            with open(path, encoding="utf-8") as f:
+                hit = scan(f.readlines())
+        except OSError:
+            return None
+    return hit
+
+
+def last_turn_context(session_id):
+    """Raw usage dict for a session's last assistant turn (back-compat shape)."""
+    hit = _last_assistant_usage(session_id)
+    return hit[0] if hit else None
+
+
+def session_context(session_id):
+    """Context-window state for a session, computed from the last assistant turn.
+
+    Returns {used, pct, left, limit, model} or None if no usage is found.
+    `used` counts input + cache_creation + cache_read (the tokens occupying the
+    window); output tokens are excluded as they don't persist in context.
+    """
+    hit = _last_assistant_usage(session_id)
+    if not hit:
+        return None
+    u, model = hit
+    used = (u.get("input_tokens", 0) +
+            u.get("cache_creation_input_tokens", 0) +
+            u.get("cache_read_input_tokens", 0))
+    limit = context_limit(model)
+    return {
+        "used":  used,
+        "pct":   used / limit * 100,
+        "left":  limit - used,
+        "limit": limit,
+        "model": model,
+    }
 
 
 # ── Formatting ────────────────────────────────────────────────────────────────
@@ -337,13 +424,11 @@ def render(args):
             start = min(r["ts"] for r in sess_rows)
             mins  = int((datetime.now(timezone.utc) - start).total_seconds() // 60)
 
-            last_u = last_turn_context(sid)
-            if last_u:
-                ctx_used = (last_u.get("input_tokens", 0) +
-                            last_u.get("cache_creation_input_tokens", 0) +
-                            last_u.get("cache_read_input_tokens", 0))
-                ctx_pct  = ctx_used / CONTEXT_LIMIT * 100
-                ctx_left = CONTEXT_LIMIT - ctx_used
+            ctx = session_context(sid)
+            if ctx:
+                ctx_used = ctx["used"]
+                ctx_pct  = ctx["pct"]
+                ctx_left = ctx["left"]
             else:
                 ctx_used = ctx_pct = ctx_left = None
 
@@ -399,6 +484,26 @@ def render(args):
     print(f"\n{'═' * W}\n")
 
 
+def build_snapshot(session_id=None, include_plan=True):
+    """Machine-readable state for agents/orchestrators.
+
+    `plan` is the slow/fragile network signal (None when --no-live or
+    unavailable); `sessions` and `session` are cheap local tail reads.
+    """
+    snap = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "context_limit": CONTEXT_LIMIT,
+        "plan": fetch_plan_usage() if include_plan else None,
+        "sessions": [
+            {**sess, "context": session_context(sess["session_id"])}
+            for sess in active_sessions()
+        ],
+    }
+    if session_id:
+        snap["session"] = session_context(session_id)
+    return snap
+
+
 def main():
     parser = argparse.ArgumentParser(description="Claude Code usage tracker")
     parser.add_argument("-w", "--watch",    action="store_true", help="Refresh continuously")
@@ -406,7 +511,14 @@ def main():
     parser.add_argument("-d", "--days",     type=int, default=7,  help="Days of history (default 7)")
     parser.add_argument("-a", "--all",      action="store_true",  help="Show all-time history")
     parser.add_argument("--no-live",        action="store_true",  help="Skip live plan usage fetch")
+    parser.add_argument("--json",           action="store_true",  help="Emit machine-readable JSON snapshot and exit")
+    parser.add_argument("--session",        metavar="ID",         help="With --json, include context state for this session id")
     args = parser.parse_args()
+
+    if args.json:
+        snap = build_snapshot(session_id=args.session, include_plan=not args.no_live)
+        print(json.dumps(snap, default=str))
+        return
 
     if args.watch:
         try:
