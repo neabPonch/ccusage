@@ -166,17 +166,24 @@ def sum_usage(rows):
     return dict(totals)
 
 
-def current_session_id():
-    best = None
+def active_sessions():
+    """Return list of dicts for every open Claude Code session, newest-first."""
+    sessions = []
     for f in SESSIONS_DIR.glob("*.json"):
         try:
             d = json.loads(f.read_text())
             if d.get("status") in ("idle", "running", "busy"):
-                if best is None or d.get("updatedAt", 0) > best[1]:
-                    best = (d.get("sessionId"), d.get("updatedAt", 0))
+                cwd = d.get("cwd", "")
+                sessions.append({
+                    "session_id": d.get("sessionId", ""),
+                    "status":     d.get("status", "idle"),
+                    "cwd":        cwd,
+                    "name":       d.get("name") or cwd.replace("/Users/neabponch", "~"),
+                    "updated_at": d.get("updatedAt", 0),
+                })
         except Exception:
             pass
-    return best[0] if best else None
+    return sorted(sessions, key=lambda s: s["updated_at"], reverse=True)
 
 
 def last_turn_context(session_id):
@@ -262,7 +269,7 @@ def render(args):
             deduped.append(r)
     rows = deduped
 
-    cur_sid = current_session_id()
+    open_sessions = active_sessions()
 
     by_session = defaultdict(list)
     by_day     = defaultdict(list)
@@ -303,52 +310,58 @@ def render(args):
     else:
         print(f"\n  PLAN LIMITS  (run: pip3 install cloudscraper  to enable live data)")
 
-    # ── Current session ────────────────────────────────────────────────────
-    if cur_sid and cur_sid in by_session:
-        sess_rows = by_session[cur_sid]
-        u     = sum_usage(sess_rows)
-        inp   = u.get("input_tokens", 0)
-        cc    = u.get("cache_creation_input_tokens", 0)
-        cr    = u.get("cache_read_input_tokens", 0)
-        out   = u.get("output_tokens", 0)
-        total = inp + cc + cr + out
-        model   = sess_rows[-1]["model"] if sess_rows else "?"
-        project = sess_rows[-1]["project"].replace("-Users-neabponch-", "~/")
-        start   = min(r["ts"] for r in sess_rows)
-        mins    = int((datetime.now(timezone.utc) - start).total_seconds() // 60)
-
-        last_u = last_turn_context(cur_sid)
-        if last_u:
-            ctx_used = (last_u.get("input_tokens", 0) +
-                        last_u.get("cache_creation_input_tokens", 0) +
-                        last_u.get("cache_read_input_tokens", 0))
-            ctx_pct  = ctx_used / CONTEXT_LIMIT * 100
-            ctx_left = CONTEXT_LIMIT - ctx_used
-        else:
-            ctx_used = ctx_pct = ctx_left = None
-
-        print(f"\n  CURRENT SESSION  ({mins}m, {len(sess_rows)} turns)")
-        print(f"  Model   : {model}")
-        print(f"  Project : {project}")
-
-        if ctx_used is not None:
-            color = pct_color(ctx_pct)
-            b = bar(ctx_pct)
-            print(f"\n  Context window ({CONTEXT_LIMIT//1000}K)")
-            print(f"  [{color}{b}{RESET}] {color}{ctx_pct:.1f}%{RESET}  ({fmt_tokens(ctx_left)} remaining)")
-
-        print(f"\n  ┌───────────────────────────────────────────┐")
-        print(f"  │  Input (fresh)  : {fmt_tokens(inp):>10}             │")
-        print(f"  │  Cache created  : {fmt_tokens(cc):>10}             │")
-        print(f"  │  Cache read     : {fmt_tokens(cr):>10}             │")
-        print(f"  │  Output         : {fmt_tokens(out):>10}             │")
-        print(f"  │  Total          : {fmt_tokens(total):>10}             │")
-        print(f"  │  API-equiv cost : {fmt_cost(cost_usd(u)):>10}             │")
-        print(f"  └───────────────────────────────────────────┘")
-    elif cur_sid:
-        print(f"\n  CURRENT SESSION: {cur_sid[:8]}... (no turns yet today)")
+    # ── Active sessions ────────────────────────────────────────────────────
+    if not open_sessions:
+        print(f"\n  No active sessions detected")
     else:
-        print(f"\n  No active session detected")
+        for i, sess in enumerate(open_sessions):
+            sid    = sess["session_id"]
+            status = sess["status"]
+            title  = sess["name"]
+            tag    = "● ACTIVE" if status == "busy" else "○ IDLE"
+
+            print(f"\n  {tag}  {title}")
+
+            sess_rows = by_session.get(sid, [])
+            if not sess_rows:
+                print(f"  (no turns recorded today)")
+                continue
+
+            u     = sum_usage(sess_rows)
+            inp   = u.get("input_tokens", 0)
+            cc    = u.get("cache_creation_input_tokens", 0)
+            cr    = u.get("cache_read_input_tokens", 0)
+            out   = u.get("output_tokens", 0)
+            total = inp + cc + cr + out
+            model = sess_rows[-1]["model"] if sess_rows else "?"
+            start = min(r["ts"] for r in sess_rows)
+            mins  = int((datetime.now(timezone.utc) - start).total_seconds() // 60)
+
+            last_u = last_turn_context(sid)
+            if last_u:
+                ctx_used = (last_u.get("input_tokens", 0) +
+                            last_u.get("cache_creation_input_tokens", 0) +
+                            last_u.get("cache_read_input_tokens", 0))
+                ctx_pct  = ctx_used / CONTEXT_LIMIT * 100
+                ctx_left = CONTEXT_LIMIT - ctx_used
+            else:
+                ctx_used = ctx_pct = ctx_left = None
+
+            print(f"  Model: {model}  •  {len(sess_rows)} turns  •  {mins}m elapsed")
+
+            if ctx_used is not None:
+                color = pct_color(ctx_pct)
+                b = bar(ctx_pct)
+                print(f"  Context  [{color}{b}{RESET}] {color}{ctx_pct:.1f}%{RESET}  ({fmt_tokens(ctx_left)} left)")
+
+            print(f"  ┌───────────────────────────────────────────┐")
+            print(f"  │  Input (fresh)  : {fmt_tokens(inp):>10}             │")
+            print(f"  │  Cache created  : {fmt_tokens(cc):>10}             │")
+            print(f"  │  Cache read     : {fmt_tokens(cr):>10}             │")
+            print(f"  │  Output         : {fmt_tokens(out):>10}             │")
+            print(f"  │  Total          : {fmt_tokens(total):>10}             │")
+            print(f"  │  API-equiv cost : {fmt_cost(cost_usd(u)):>10}             │")
+            print(f"  └───────────────────────────────────────────┘")
 
     # ── Today's totals ─────────────────────────────────────────────────────
     today_rows = by_day.get(today, [])
