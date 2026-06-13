@@ -25,7 +25,7 @@ except BlockingIOError:
 
 # Add repo dir to path so we can import ccusage helpers
 sys.path.insert(0, str(Path(__file__).parent))
-from ccusage import fetch_plan_usage, active_sessions, last_turn_context, CONTEXT_LIMIT
+from ccusage import build_snapshot, write_snapshot, CONTEXT_LIMIT
 
 REFRESH_SECS = 60  # how often to poll
 
@@ -73,24 +73,21 @@ class CcusageApp(rumps.App):
         threading.Thread(target=self._fetch_worker, daemon=True).start()
 
     def _fetch_worker(self):
-        plan = fetch_plan_usage()
+        # Build the snapshot once and persist it for agents/orchestrators; the UI
+        # below is derived from the same data so the plan fetch happens only once.
+        snap = build_snapshot(include_plan=True)
+        try:
+            write_snapshot(snap)
+        except Exception:
+            pass  # UI must keep working even if the state file can't be written
 
-        # Collect context % for each active session
-        sess_ctxs = []
-        for sess in active_sessions():
-            last_u = last_turn_context(sess["session_id"])
-            if last_u:
-                ctx_used = (last_u.get("input_tokens", 0) +
-                            last_u.get("cache_creation_input_tokens", 0) +
-                            last_u.get("cache_read_input_tokens", 0))
-                sess_ctxs.append({
-                    "name":    sess["name"],
-                    "status":  sess["status"],
-                    "ctx_pct": ctx_used / CONTEXT_LIMIT * 100,
-                })
+        sess_ctxs = [
+            {"name": s["name"], "status": s["status"], "ctx_pct": s["context"]["pct"]}
+            for s in snap["sessions"] if s.get("context")
+        ]
 
         with self._lock:
-            self._pending = {"plan": plan, "sess_ctxs": sess_ctxs, "ready": True}
+            self._pending = {"plan": snap["plan"], "sess_ctxs": sess_ctxs, "ready": True}
         self._fetching = False
 
     # ── Timer: runs on main thread, applies pending data ─────────────────────

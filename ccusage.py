@@ -25,6 +25,8 @@ from collections import defaultdict
 
 PROJECTS_DIR  = Path.home() / ".claude" / "projects"
 SESSIONS_DIR  = Path.home() / ".claude" / "sessions"
+STATE_DIR     = Path.home() / ".claude" / "cctracker"
+STATE_FILE    = STATE_DIR / "state.json"   # snapshot written by the menubar poller
 CONTEXT_LIMIT = 200_000  # default context window (kept for back-compat imports)
 
 # Per-model context windows, matched by substring on the model id. Most current
@@ -504,6 +506,41 @@ def build_snapshot(session_id=None, include_plan=True):
     return snap
 
 
+def write_snapshot(snap=None, path=STATE_FILE):
+    """Atomically write a snapshot to `path` (temp file + rename).
+
+    Intended to be called on the menubar poll loop so the slow/fragile plan
+    fetch happens in one place; agents read this file instead of each scanning
+    transcripts or hitting claude.ai. Returns the snapshot written.
+    """
+    if snap is None:
+        snap = build_snapshot()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(snap, f, default=str)
+        os.replace(tmp, path)   # atomic on POSIX
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return snap
+
+
+def read_snapshot(path=STATE_FILE):
+    """Read the last snapshot written by the poller, or None if unavailable.
+
+    Callers should check `generated_at` for staleness (poller dead/slow).
+    """
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return None
+
+
 def main():
     parser = argparse.ArgumentParser(description="Claude Code usage tracker")
     parser.add_argument("-w", "--watch",    action="store_true", help="Refresh continuously")
@@ -513,11 +550,18 @@ def main():
     parser.add_argument("--no-live",        action="store_true",  help="Skip live plan usage fetch")
     parser.add_argument("--json",           action="store_true",  help="Emit machine-readable JSON snapshot and exit")
     parser.add_argument("--session",        metavar="ID",         help="With --json, include context state for this session id")
+    parser.add_argument("--write",          action="store_true",  help=f"Write snapshot to {STATE_FILE} and exit")
     args = parser.parse_args()
 
     if args.json:
         snap = build_snapshot(session_id=args.session, include_plan=not args.no_live)
         print(json.dumps(snap, default=str))
+        return
+
+    if args.write:
+        snap = write_snapshot(build_snapshot(session_id=args.session, include_plan=not args.no_live))
+        print(f"wrote {STATE_FILE}  ({len(snap['sessions'])} sessions, "
+              f"plan={'yes' if snap['plan'] else 'no'})")
         return
 
     if args.watch:
