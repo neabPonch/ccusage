@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git checkout -b *)",
+      "Bash(git push *)",
+      "Bash(gh pr create *)",
+      "Bash(gh pr view *)",
+      "Bash(gh pr merge *)",
+      "Bash(launchctl *)",
+      "Bash(pkill -f ccusage*)",
+      "Bash(/opt/homebrew/bin/python3.11 *)"
+    ]
+  }
+}
