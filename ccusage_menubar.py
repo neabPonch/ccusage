@@ -10,8 +10,18 @@ import rumps
 import threading
 import subprocess
 import sys
+import os
+import fcntl
 from pathlib import Path
 from datetime import datetime, timezone
+
+# ── Single-instance guard ─────────────────────────────────────────────────────
+_LOCK_FILE = Path("/tmp/ccusage_menubar.lock")
+_lock_fh = open(_LOCK_FILE, "w")
+try:
+    fcntl.flock(_lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    sys.exit(0)  # another instance is already running
 
 # Add repo dir to path so we can import ccusage helpers
 sys.path.insert(0, str(Path(__file__).parent))
