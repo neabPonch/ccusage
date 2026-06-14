@@ -29,12 +29,16 @@ STATE_DIR     = Path.home() / ".claude" / "cctracker"
 STATE_FILE    = STATE_DIR / "state.json"   # snapshot written by the menubar poller
 CONTEXT_LIMIT = 200_000  # default context window (kept for back-compat imports)
 
-# Per-model context windows, matched by substring on the model id. Most current
-# Claude models (Opus/Sonnet/Haiku 4.x) are 200k, so the default is correct for
-# them — this map exists so 1M-context betas or future models can override
-# without touching call sites.
+# Per-model context windows, matched by substring on the model id. The current
+# frontier models (Opus 4.6/4.7/4.8, Sonnet 4.6, Fable 5) ship a 1M window; only
+# Haiku 4.5 and older models are 200k, which the default below covers.
 MODEL_CONTEXT_LIMITS = {
-    # "claude-...-1m": 1_000_000,
+    "claude-fable-5":    1_000_000,
+    "claude-mythos-5":   1_000_000,
+    "claude-opus-4-8":   1_000_000,
+    "claude-opus-4-7":   1_000_000,
+    "claude-opus-4-6":   1_000_000,
+    "claude-sonnet-4-6": 1_000_000,
 }
 
 
