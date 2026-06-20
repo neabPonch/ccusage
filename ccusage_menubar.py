@@ -75,20 +75,35 @@ class CcusageApp(rumps.App):
     def _fetch_worker(self):
         # Build the snapshot once and persist it for agents/orchestrators; the UI
         # below is derived from the same data so the plan fetch happens only once.
-        snap = build_snapshot(include_plan=True)
+        #
+        # Everything runs inside try/finally so that ANY failure (network blip,
+        # Cloudflare challenge, expired cookie, locked cookies.sqlite, JSON error)
+        # still resets `_fetching`. Otherwise the flag stays True forever and
+        # `_start_fetch`'s guard silently kills all future polling — the process
+        # stays alive but the menu freezes on stale data.
         try:
-            write_snapshot(snap)
-        except Exception:
-            pass  # UI must keep working even if the state file can't be written
+            snap = build_snapshot(include_plan=True)
+            try:
+                write_snapshot(snap)
+            except Exception:
+                pass  # UI must keep working even if the state file can't be written
 
-        sess_ctxs = [
-            {"name": s["name"], "status": s["status"], "ctx_pct": s["context"]["pct"]}
-            for s in snap["sessions"] if s.get("context")
-        ]
+            sess_ctxs = [
+                {"name": s["name"], "status": s["status"], "ctx_pct": s["context"]["pct"]}
+                for s in snap["sessions"] if s.get("context")
+            ]
 
-        with self._lock:
-            self._pending = {"plan": snap["plan"], "sess_ctxs": sess_ctxs, "ready": True}
-        self._fetching = False
+            with self._lock:
+                self._pending = {
+                    "plan": snap["plan"],
+                    "sess_ctxs": sess_ctxs,
+                    "generated_at": snap.get("generated_at"),
+                    "ready": True,
+                }
+        except Exception as e:
+            print(f"[ccusage] fetch failed: {e}", file=sys.stderr)
+        finally:
+            self._fetching = False
 
     # ── Timer: runs on main thread, applies pending data ─────────────────────
 
@@ -117,13 +132,24 @@ class CcusageApp(rumps.App):
         fh_pct = fh.get("utilization")
         sd_pct = sd.get("utilization")
 
+        # How old is this data? If polling ever stalls, surface it instead of
+        # letting a frozen number masquerade as a live reading.
+        age_secs = None
+        try:
+            gen = datetime.fromisoformat(data["generated_at"])
+            age_secs = (datetime.now(timezone.utc) - gen).total_seconds()
+        except Exception:
+            pass
+        stale = age_secs is not None and age_secs > 3 * REFRESH_SECS
+
         # Menu bar title — show 5h% and active session count
         n_active = sum(1 for s in sess_ctxs if s["status"] == "busy")
         sess_tag = f"  {n_active}●" if n_active else ""
+        stale_tag = "⚠ " if stale else ""
         if fh_pct is not None:
-            self.title = f"5h:{fh_pct:.0f}%{sess_tag} {pct_emoji(fh_pct)}"
+            self.title = f"{stale_tag}5h:{fh_pct:.0f}%{sess_tag} {pct_emoji(fh_pct)}"
         else:
-            self.title = f"ccusage{sess_tag} ⚪"
+            self.title = f"{stale_tag}ccusage{sess_tag} ⚪"
 
         # Rebuild menu
         self.menu.clear()
@@ -152,6 +178,10 @@ class CcusageApp(rumps.App):
             self.menu.add(rumps.MenuItem("No data — log into claude.ai in Firefox"))
 
         self.menu.add(None)
+        if age_secs is not None:
+            mins = int(age_secs // 60)
+            when = "just now" if mins == 0 else f"{mins}m ago"
+            self.menu.add(rumps.MenuItem(f"{'⚠ stale — ' if stale else ''}updated {when}"))
         self.menu.add(rumps.MenuItem("Open full dashboard", callback=self.open_dashboard))
         self.menu.add(rumps.MenuItem("Refresh now",         callback=self.refresh_now))
         self.menu.add(None)
@@ -164,7 +194,7 @@ class CcusageApp(rumps.App):
         subprocess.Popen([
             "osascript", "-e",
             f'tell application "Terminal" to do script '
-            f'"python3 {script} --all; echo; read -rsp \'Press enter to close…\' _"'
+            f'"/opt/homebrew/bin/python3.11 {script} --all; echo; read -rsp \'Press enter to close…\' _"'
         ])
 
     def refresh_now(self, _):
