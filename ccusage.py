@@ -109,6 +109,7 @@ def fetch_plan_usage():
     if not cookies:
         return None
 
+    scraper = None
     try:
         scraper = cloudscraper.create_scraper(
             browser={"browser": "firefox", "platform": "darwin", "mobile": False}
@@ -129,6 +130,13 @@ def fetch_plan_usage():
         return data
     except Exception:
         return None
+    finally:
+        # cloudscraper returns a requests.Session; it pools keep-alive sockets to
+        # claude.ai. The menu bar app calls this every refresh forever, so failing
+        # to close leaks an fd per cycle until the process hits the open-files
+        # limit (Errno 24) and silently freezes. Always release the pool.
+        if scraper is not None:
+            scraper.close()
 
 
 # ── Local JSONL helpers ───────────────────────────────────────────────────────
