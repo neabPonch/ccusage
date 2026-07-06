@@ -92,6 +92,55 @@ def _firefox_cookies():
     return cookies
 
 
+# Live-plan fetch backoff: claude.ai sits behind Cloudflare and will 429 (rate
+# limit) then 503 (block) a client that polls too hard. The menu bar fetches
+# every 60s forever, so without backoff a single throttle turns into a
+# self-perpetuating block — it keeps hammering the very endpoint that's asking
+# it to stop. This cooldown makes it stand down (exponentially, capped) after a
+# throttle and recover on its own; it survives restarts (file-backed) so a
+# bounce doesn't immediately re-hammer.
+_PLAN_COOLDOWN_FILE = Path(tempfile.gettempdir()) / "ccusage_plan_cooldown.json"
+_PLAN_BACKOFF_BASE = 120        # seconds after the first failure
+_PLAN_BACKOFF_CAP = 1800        # 30 min ceiling
+
+
+def _plan_cooldown_remaining():
+    """Seconds to wait before the next live-plan fetch (0 = clear to go)."""
+    try:
+        st = json.loads(_PLAN_COOLDOWN_FILE.read_text())
+        return max(0.0, float(st.get("until", 0)) - time.time())
+    except Exception:
+        return 0.0
+
+
+def _plan_backoff(retry_after=None):
+    """Record a failed/throttled fetch and grow the cooldown (doubles per
+    consecutive failure, capped; honors a server Retry-After when longer)."""
+    try:
+        st = json.loads(_PLAN_COOLDOWN_FILE.read_text())
+    except Exception:
+        st = {}
+    fails = int(st.get("fails", 0)) + 1
+    wait = min(_PLAN_BACKOFF_CAP, _PLAN_BACKOFF_BASE * (2 ** (fails - 1)))
+    try:
+        wait = max(wait, float(retry_after)) if retry_after else wait
+    except (TypeError, ValueError):
+        pass
+    try:
+        _PLAN_COOLDOWN_FILE.write_text(
+            json.dumps({"until": time.time() + wait, "fails": fails}))
+    except Exception:
+        pass
+
+
+def _plan_backoff_clear():
+    """A successful fetch resets the backoff ladder."""
+    try:
+        _PLAN_COOLDOWN_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def fetch_plan_usage():
     """
     Return dict with 'five_hour' and 'seven_day' utilization from claude.ai,
@@ -100,6 +149,9 @@ def fetch_plan_usage():
     Structure per window:
       {"utilization": 81.0, "resets_at": "2026-06-13T16:20:00+00:00"}
     """
+    if _plan_cooldown_remaining() > 0:
+        return None                     # cooling down after a throttle — don't poke it
+
     try:
         import cloudscraper
     except ImportError:
@@ -109,6 +161,9 @@ def fetch_plan_usage():
     if not cookies:
         return None
 
+    def _throttled(resp):
+        return resp.status_code == 429 or resp.status_code >= 500
+
     scraper = None
     try:
         scraper = cloudscraper.create_scraper(
@@ -117,18 +172,34 @@ def fetch_plan_usage():
         scraper.cookies.update(cookies)
         hdrs = {"Accept": "application/json", "Referer": "https://claude.ai/settings/usage"}
 
-        orgs = scraper.get("https://claude.ai/api/organizations", headers=hdrs, timeout=8).json()
+        r = scraper.get("https://claude.ai/api/organizations", headers=hdrs, timeout=8)
+        if _throttled(r):
+            _plan_backoff(r.headers.get("retry-after"))
+            return None
+        if r.status_code != 200:
+            _plan_backoff()
+            return None
+        orgs = r.json()
         if not orgs:
             return None
         org_uuid = orgs[0]["uuid"]
 
-        data = scraper.get(
+        r2 = scraper.get(
             f"https://claude.ai/api/organizations/{org_uuid}/usage",
             headers=hdrs,
             timeout=8,
-        ).json()
+        )
+        if _throttled(r2):
+            _plan_backoff(r2.headers.get("retry-after"))
+            return None
+        if r2.status_code != 200:
+            _plan_backoff()
+            return None
+        data = r2.json()
+        _plan_backoff_clear()           # success — clear the cooldown ladder
         return data
     except Exception:
+        _plan_backoff()
         return None
     finally:
         # cloudscraper returns a requests.Session; it pools keep-alive sockets to
