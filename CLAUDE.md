@@ -37,13 +37,16 @@ tail -f /tmp/ccusage.log
 
 ## Dependencies
 
-- Python 3.11 (homebrew: `/opt/homebrew/bin/python3.11`)
+- Python 3: the CLI (`ccusage.py`) runs under `python3` on PATH; the menu bar app
+  pins `/opt/homebrew/bin/python3.11`. Install `cloudscraper` into both
+  interpreters (`rumps` only into 3.11).
 - `cloudscraper` — Cloudflare bypass for claude.ai API
 - `rumps` — macOS menu bar framework
 - Firefox with active claude.ai session — live plan limit data
 
 ```bash
 /opt/homebrew/bin/python3.11 -m pip install rumps cloudscraper
+python3 -m pip install cloudscraper
 ```
 
 ## How the live plan data works
